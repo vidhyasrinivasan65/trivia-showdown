@@ -1098,7 +1098,7 @@ const Store = {
       const { error } = await this.sb.from("open_scores")
         .upsert({date, player, scores: payload.scores, updated_at: new Date().toISOString()},
                 {onConflict: "date,player"});
-      if (error) throw error;
+      if (error) throw new Error("open scores: " + error.message);
       return;
     }
     if (!this.db) return;
@@ -1111,7 +1111,7 @@ const Store = {
       const { error } = await this.sb.from("flags")
         .upsert({date, player, games, updated_at: new Date().toISOString()},
                 {onConflict: "date,player"});
-      if (error) throw error;
+      if (error) throw new Error("flags: " + error.message);
       return;
     }
     if (!this.db) return;
@@ -1121,11 +1121,16 @@ const Store = {
   async putSealed(date, payload){
     this.lset(`ts_sealed_${date}`, payload);
     if (this.sb){
-      // write-only table: this goes in and cannot be read back out
+      // Write-only table. An upsert would need to read the existing row to
+      // detect the conflict, and nothing may read this table, so replace the
+      // row explicitly instead.
+      const { error: delErr } = await this.sb.from("sealed_scores")
+        .delete().eq("date", date).eq("player", payload.player);
+      if (delErr) throw new Error("sealed delete: " + delErr.message);
       const { error } = await this.sb.from("sealed_scores")
-        .upsert({date, player: payload.player, scores: payload.scores,
-                 updated_at: new Date().toISOString()}, {onConflict: "date,player"});
-      if (error) throw error;
+        .insert({date, player: payload.player, scores: payload.scores,
+                 updated_at: new Date().toISOString()});
+      if (error) throw new Error("sealed insert: " + error.message);
       return;
     }
     if (!this.db || !this.uid) return;
@@ -1513,9 +1518,22 @@ function renderResult(){
     };
     const word = hid ? "·" : ((a && a.word) || (b && b.word) || "—");
     const r = pts.perGame[g];
-    const mark = (!hid && r && r.winner && r.winner !== "tie") ? ` <span class="tiny">${r.alone ? "(alone)" : ""}</span>` : "";
-    rows += `<tr><td>${cfg.label}${mark}</td><td>${fmt(a)}</td><td>${fmt(b)}</td><td>${word}</td></tr>`;
+    const mark = (!hid && r && r.alone) ? ` <span class="tiny">(alone)</span>` : "";
+    // point awarded for this game, so the one-point-per-game rule is visible
+    let p1p = "–", p2p = "–";
+    if (!hid && r){
+      if (r.winner === "tie"){ p1p = CONFIG.pointsTie; p2p = CONFIG.pointsTie; }
+      else if (r.winner === P1){ p1p = r.alone ? CONFIG.pointsAlone : CONFIG.pointsWin; p2p = 0; }
+      else if (r.winner === P2){ p2p = r.alone ? CONFIG.pointsAlone : CONFIG.pointsWin; p1p = 0; }
+    }
+    const win1 = p1p !== "–" && p1p > p2p ? ' style="background:var(--marigold)"' : "";
+    const win2 = p2p !== "–" && p2p > p1p ? ' style="background:var(--marigold)"' : "";
+    rows += `<tr><td>${cfg.label}${mark}</td>` +
+            `<td${win1}>${fmt(a)}<br><span class="tiny">${p1p} pt</span></td>` +
+            `<td${win2}>${fmt(b)}<br><span class="tiny">${p2p} pt</span></td>` +
+            `<td>${word}</td></tr>`;
   }
+  rows += `<tr><th>Total</th><th>${pts[P1]}</th><th>${pts[P2]}</th><th></th></tr>`;
   tb.innerHTML = rows;
   body.appendChild(tb);
 }
@@ -1825,12 +1843,18 @@ async function save(){
     await Store.putOpen(date, App.me, {date, player:App.me, scores:openScores, ts:Date.now()});
     await Store.putSealed(date, {date, player:App.me, scores:sealedScores, ts:Date.now()});
     await Store.putFlag(date, App.me, gamesPlayed);
-    msg.textContent = "Saved.";
-    Sound.ok();
+    msg.textContent = "Saving…";
     await refreshAll();
+    const landed = !!App.data.flags[`${date}__${App.me}`];
+    msg.textContent = landed ? "Saved." : "Saved here, but the board did not confirm it.";
+    if (landed) Sound.ok(); else Sound.nope();
   }catch(e){
-    msg.textContent = "Could not save. Your scores are kept on this device.";
-    document.getElementById("saveMsg").classList.add("err");
+    msg.textContent = "";
+    clearBanners();
+    banner("Your scores were NOT saved to the shared board. " +
+           (e && e.message ? e.message : "Unknown error") +
+           " — they are kept on this device for now.", "err");
+    window.scrollTo({top: 0, behavior: "smooth"});
     Sound.nope();
   }
   btn.disabled = false;
@@ -1839,6 +1863,8 @@ async function save(){
 /** If both have played, publish my own sealed entry so the other can see it. */
 async function maybeReveal(){
   if (!App.me) return;
+  // On Supabase the revealed_scores view decides this, server side.
+  if (Store.sb) return;
   const dates = allDates().slice(-40);
   for (const d of dates){
     if (!bothPlayed(d)) continue;
