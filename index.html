@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Trivia Showdown</title>
+<meta http-equiv="Cache-Control" content="no-cache, must-revalidate">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
@@ -434,6 +435,8 @@ const SUPABASE = {
   url: "https://chwclpuyehnsvvemhucg.supabase.co",
   anonKey: "sb_publishable_1I2DJgbnmVESlnXnQxxfTw_HxMV1MA5"
 };
+
+const BUILD = "2026-10-26b";
 
 const CONFIG = {
   // The scoreboard's day boundary. Both players share this one clock,
@@ -1124,14 +1127,28 @@ const Store = {
       // Write-only table. An upsert would need to read the existing row to
       // detect the conflict, and nothing may read this table, so replace the
       // row explicitly instead.
+      const row = {date, player: payload.player, scores: payload.scores,
+                   updated_at: new Date().toISOString()};
+
+      // Try to clear any previous row for the day first.
       const { error: delErr } = await this.sb.from("sealed_scores")
         .delete().eq("date", date).eq("player", payload.player);
-      if (delErr) throw new Error("sealed delete: " + delErr.message);
-      const { error } = await this.sb.from("sealed_scores")
-        .insert({date, player: payload.player, scores: payload.scores,
-                 updated_at: new Date().toISOString()});
-      if (error) throw new Error("sealed insert: " + error.message);
-      return;
+
+      const { error: insErr } = await this.sb.from("sealed_scores").insert(row);
+      if (!insErr) return;
+
+      // 23505 means a row for this day is still there, so the delete did not
+      // take. Update it in place instead — an update needs no read, so it
+      // works even though nothing may read this table.
+      if (insErr.code === "23505" || /duplicate key/i.test(insErr.message || "")){
+        const { error: updErr } = await this.sb.from("sealed_scores")
+          .update({scores: payload.scores, updated_at: row.updated_at})
+          .eq("date", date).eq("player", payload.player);
+        if (!updErr) return;
+        throw new Error("sealed update: " + updErr.message +
+          (delErr ? " (delete also failed: " + delErr.message + ")" : ""));
+      }
+      throw new Error("sealed insert: " + insErr.message);
     }
     if (!this.db || !this.uid) return;
     await this.db.collection("data/users/" + this.uid).doc(date).set(payload);
@@ -2105,7 +2122,7 @@ document.getElementById("calNext").onclick = () => {
   const mode = await Store.init();
   await loadArtwork();
   const note = document.getElementById("storageNote");
-  if (mode === "supabase") note.textContent = "Connected to your own Supabase board. Sealed scores are held in a table nobody can read until you have both played.";
+  if (mode === "supabase") note.textContent = "Connected to your own Supabase board · build " + BUILD;
   else if (mode === "shared") note.textContent = "Scores sync between both of you. Sealed scores are stored privately until reveal.";
   else if (mode === "shared-nopriv") note.textContent = "Signed out, so sealed scores stay on this device only.";
   else note.textContent = "Offline mode — scores are kept on this device.";
